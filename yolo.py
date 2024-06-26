@@ -6,6 +6,11 @@ Class definition of YOLO_v3 style detection model on image and video
 import colorsys
 import os
 from timeit import default_timer as timer
+import time
+
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
 
 import numpy as np
 from keras import backend as K
@@ -13,10 +18,20 @@ from keras.models import load_model
 from keras.layers import Input
 from PIL import Image, ImageFont, ImageDraw
 
+from myopic_filter import bayes_filter
 from yolo3.model import yolo_eval, yolo_body, tiny_yolo_body
 from yolo3.utils import letterbox_image
 import os
-from keras.utils import multi_gpu_model
+#from keras.utils import multi_gpu_model
+
+from julia.api import Julia
+jl = Julia(compiled_modules=False)
+
+# Load your Julia functions
+jl.eval('include("falco_function.jl")')
+
+# Initialize belief using Julia's initialize_belief()
+belief = jl.eval("reset_belief()")
 
 class YOLO(object):
     _defaults = {
@@ -101,6 +116,7 @@ class YOLO(object):
 
     def detect_image(self, image):
         start = timer()
+        score = 0
 
         if self.model_image_size != (None, None):
             assert self.model_image_size[0]%32 == 0, 'Multiples of 32 required'
@@ -145,7 +161,7 @@ class YOLO(object):
             bottom = min(image.size[1], np.floor(bottom + 0.5).astype('int32'))
             right = min(image.size[0], np.floor(right + 0.5).astype('int32'))
             print(label, (left, top), (right, bottom))
-
+            #print(f'label_size = {label_size}, type = {type(label_size)}')
             if top - label_size[1] >= 0:
                 text_origin = np.array([left, top - label_size[1]])
             else:
@@ -164,7 +180,7 @@ class YOLO(object):
 
         end = timer()
         print(end - start)
-        return image
+        return image, score
 
     def close_session(self):
         self.sess.close()
@@ -183,30 +199,280 @@ def detect_video(yolo, video_path, output_path=""):
         print("!!! TYPE:", type(output_path), type(video_FourCC), type(video_fps), type(video_size))
         out = cv2.VideoWriter(output_path, video_FourCC, video_fps, video_size)
     accum_time = 0
+    count_frame = 0
     curr_fps = 0
     fps = "FPS: ??"
     prev_time = timer()
+    frames = []
+    yolo_alerts = []
+    pomdp_alerts = []
+    pomdp_gathers = []
+    neoCount = 0
+    neoCount_list = []
+    cs_list = []
+    action_list = []
+    comp_time = []
     while True:
         return_value, frame = vid.read()
-        image = Image.fromarray(frame)
-        image = yolo.detect_image(image)
-        result = np.asarray(image)
-        curr_time = timer()
-        exec_time = curr_time - prev_time
-        prev_time = curr_time
-        accum_time = accum_time + exec_time
-        curr_fps = curr_fps + 1
-        if accum_time > 1:
-            accum_time = accum_time - 1
-            fps = "FPS: " + str(curr_fps)
-            curr_fps = 0
-        cv2.putText(result, text=fps, org=(3, 15), fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-                    fontScale=0.50, color=(255, 0, 0), thickness=2)
-        cv2.namedWindow("result", cv2.WINDOW_NORMAL)
-        cv2.imshow("result", result)
-        if isOutput:
-            out.write(result)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        if return_value:
+            count_frame += 1
+            if count_frame %5 == 0:
+                start_frame = time.time()
+                neoCount += 1
+                neoCount_list.append(neoCount)
+                image = Image.fromarray(frame)
+                image, score = yolo.detect_image(image)
+                print('Confidence score is: ', score)
+                if score is not 0:
+                    yolo_alerts.append(1)
+                else:
+                    yolo_alerts.append(0)
+                frames.append(image)
+                cs_list.append(score)
+                #action = bayes_filter(score)
+                action, belief = jl.eval(f"generate_action({score})")
+                del belief
+                action_list.append(action)
+                result = np.asarray(image)
+                curr_time = timer()
+                exec_time = curr_time - prev_time
+                prev_time = curr_time
+                accum_time = accum_time + exec_time
+                curr_fps = curr_fps + 1
+                if accum_time > 1:
+                    accum_time = accum_time - 1
+                    fps = "FPS: " + str(curr_fps)
+                    curr_fps = 0
+                cv2.putText(result, text=fps, org=(3, 15), fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                            fontScale=0.50, color=(255, 0, 0), thickness=2)
+                cv2.namedWindow("result", cv2.WINDOW_NORMAL)
+                if action == 1:
+                    print('ALERT OPERATOR!')
+                    pomdp_alerts.append(1)
+                    pomdp_gathers.append(0)
+                    #cv2.imshow('Frame', frameResult)
+                if action == 2:
+                    print('GATHER INFORMATION!')
+                    pomdp_alerts.append(0)
+                    pomdp_gathers.append(1)
+                if action == 3:
+                    print('CONTINUE MISSION!')
+                    pomdp_alerts.append(0)
+                    pomdp_gathers.append(0)
+                cv2.imshow("result", result)
+                end_frame = time.time() - start_frame
+                print(f'{end_frame*1000:.2f} [ms]')
+                comp_time.append(end_frame*1000)
+                print('--------------------------------------------------------------')
+                if isOutput:
+                    out.write(result)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        else:
             break
     yolo.close_session()
 
+    # plot cs_list versus action_list
+    df = pd.DataFrame({'Confidence scores over mission': cs_list, 
+                    'Actions taken': action_list, 'Frames': neoCount_list})
+    action_dict = {1: 'alert operator', 2: 'gather information', 3: 'continue mission'}
+    df['Actions taken'] = df['Actions taken'].map(action_dict)
+    df['Actions taken'] = pd.Categorical(df['Actions taken'], categories=action_dict.values())
+    df = pd.concat([df, pd.DataFrame({'Confidence scores over mission': [np.nan], 'Actions taken': ['alert operator']})], ignore_index=True)
+    plt.figure(1)
+    '''
+    plt.scatter(cs_list, action_list)
+    '''
+    sns.catplot(data=df, x='Confidence scores over mission', y='Actions taken', kind='swarm')
+    plt.xlabel('Confidence scores over mission')
+    plt.ylabel('Actions taken')
+    # title of the graph
+    plt.title('Decisions taken during L3 maneuver - YOLO RGB')
+    # save the figure before calling show
+    plt.tight_layout()
+    plt.savefig('yolo_rgbL3_csac.png', bbox_inches='tight')
+    plt.show()
+
+    # plot frames versus cs_list
+    plt.figure(2)
+    plt.scatter(neoCount_list, cs_list)
+    plt.xlabel('Frames')
+    plt.ylabel('Confidence score')
+    # title of the graph
+    plt.title('Confidence scores evolution during L3 maneuver - YOLO RGB')
+    # save the figure before calling show
+    plt.tight_layout()
+    plt.savefig('yolo_rgbL3_neocs.png')
+    plt.show()
+
+    # plot frames versus action_list
+    plt.figure(3)
+    '''
+    plt.scatter(neoCount_list, action_list)
+    '''
+    sns.catplot(data=df, x='Frames', y='Actions taken', kind='swarm')
+    plt.xlabel('Frames')
+    plt.ylabel('Actions taken')
+    # title of the graph
+    plt.title('Decisions evolution during L3 maneuver - YOLO RGB')
+    # save the figure before calling show
+    plt.tight_layout()
+    plt.savefig('yolo_rgbL3_neoac.png', bbox_inches='tight')
+    plt.show()
+
+    
+    # plot yolo detections 
+    detections_complete_yolo = [-1] * len(frames)
+    detections_complete_pomdp = [-1] * len(frames)
+    detections_complete_pomdp_gathers = [-1] * len(frames)
+    for i in range(len(yolo_alerts)):
+        detections_complete_yolo[i] = yolo_alerts[i]
+    for i in range(len(pomdp_alerts)):
+        detections_complete_pomdp[i] = pomdp_alerts[i]
+    for i in range(len(pomdp_gathers)):
+        detections_complete_pomdp_gathers[i] = pomdp_gathers[i]
+    plt.figure(4)
+    frame_num = list(range(len(frames)))
+    ground_truth = np.zeros(len(frames))
+    #ground_truth[:] = 1
+    #ground_truth[57:123] = 1
+    #LeveL2
+    '''
+    ground_truth[1:583] = 1
+    ground_truth[602:636] = 1
+    ground_truth[708:761] = 1
+    ground_truth[805:884] = 1
+    ground_truth[917:1044] = 1
+    ground_truth[1079:1119] = 1
+    ground_truth[1145:1180] = 1
+    ground_truth[1235:1619] = 1
+    '''
+    #Level3
+    ground_truth[227:515] = 1
+    ground_truth[570:747] = 1
+    plt.scatter(frame_num, ground_truth+3)
+    detection_array_yolo = np.array(detections_complete_yolo)
+    plt.scatter(frame_num, detection_array_yolo+2.75)
+    detection_array_pomdp = np.array(detections_complete_pomdp)
+    plt.scatter(frame_num, detection_array_pomdp+2.5)
+    detection_array_pomdp_gathers = np.array(detections_complete_pomdp_gathers)
+    plt.scatter(frame_num, detection_array_pomdp_gathers+2.25)
+    plt.ylim(3.05,4.05)
+    plt.xlabel('Frame Number')
+    plt.ylabel('Algorithms & Ground truth alerts')
+    plt.title('Alerts during L3 maneuver - YOLO RGB') 
+    plt.yticks([4,3.75,3.5,3.25],['person present','yolo','filter alerts','filter gathers info'])
+    plt.tight_layout()
+    plt.savefig('yolo_rgbL3_final.png')
+    plt.show()
+
+    plt.figure(5)
+    plt.scatter(neoCount_list, comp_time)
+    plt.xlabel('Frames')
+    plt.ylabel('Time [ms]')
+    # title of the graph
+    plt.title('Frame processing time evolution during L3 maneuver - YOLO RGB')
+    # save the figure before calling show
+    plt.tight_layout()
+    plt.savefig('yolo_rgbL3_time.png')
+    plt.show()
+    
+    # Performance metrics calculations
+    yolo_tp=0
+    yolo_fp=0
+    yolo_tn=0
+    yolo_fn=0
+    yolo_true_positives = []
+    yolo_false_positives = []
+    yolo_true_negatives = []
+    yolo_false_negatives = []
+    for i in range(len(ground_truth)):
+        if ground_truth[i] == 1 and detection_array_yolo[i] == 1:
+            yolo_tp += 1
+            #yolo_tp.append(yolo_true_positives)
+        if ground_truth[i] == 0 and detection_array_yolo[i] == 1:
+            yolo_fp += 1
+            #yolo_fp.append(yolo_false_positives)
+        if ground_truth[i] == 0 and detection_array_yolo[i] == 0:
+            yolo_tn += 1
+            #yolo_tn.append(yolo_true_negatives)
+        if ground_truth[i] == 1 and detection_array_yolo[i] == 0:
+            yolo_fn += 1
+            #yolo_fn.append(yolo_false_negatives)
+
+    pomdp_tp=0
+    pomdp_fp=0
+    pomdp_tn=0
+    pomdp_fn=0
+    pomdp_true_positives = []
+    pomdp_false_positives = []
+    pomdp_true_negatives = []
+    pomdp_false_negatives = []
+    for i in range(len(ground_truth)):
+        if ground_truth[i] == 1 and detection_array_pomdp[i] == 1:
+            pomdp_tp += 1
+            #pomdp_tp.append(pomdp_true_positives)
+        if ground_truth[i] == 0 and detection_array_pomdp[i] == 1:
+            pomdp_fp += 1
+            #pomdp_fp.append(pomdp_false_positives)
+        if ground_truth[i] == 0 and detection_array_pomdp[i] == 0:
+            pomdp_tn += 1
+            #pomdp_tn.append(pomdp_true_negatives)
+        if ground_truth[i] == 1 and detection_array_pomdp[i] == 0:
+            pomdp_fn += 1
+            #pomdp_fn.append(pomdp_false_negatives)
+
+    print('YOLO true positives: ', yolo_tp)
+    print('YOLO false positives: ', yolo_fp)
+    print('YOLO true negatives: ', yolo_tn)
+    print('YOLO false negatives: ', yolo_fn)
+
+    print('POMDP true positives: ', pomdp_tp)
+    print('POMDP false positives: ', pomdp_fp)
+    print('POMDP true negatives: ', pomdp_tn)
+    print('POMDP false negatives: ', pomdp_fn)
+
+    print('---------------------------------------')
+    
+    # Initialize metrics to 0 or some default value
+    pomdp_precision = 0
+    pomdp_recall = 0
+    pomdp_f1 = 0
+
+    if pomdp_tp + pomdp_fp > 0:
+        pomdp_precision = pomdp_tp / (pomdp_tp + pomdp_fp)
+
+    if pomdp_tp + pomdp_fn > 0:
+        pomdp_recall = pomdp_tp / (pomdp_tp + pomdp_fn)
+
+    if pomdp_precision + pomdp_recall > 0: # Ensure the denominator in F1 calculation isn't 0
+        pomdp_f1 = 2 * (pomdp_precision * pomdp_recall) / (pomdp_precision + pomdp_recall)
+    
+    yolo_precision = yolo_tp/(yolo_tp+yolo_fp)
+    yolo_recall = yolo_tp/(yolo_tp+yolo_fn)
+    yolo_f1 = 2/((1/yolo_precision)+(1/yolo_recall))
+    
+    print('POMDP precision= ', pomdp_precision)
+    print('POMDP recall= ', pomdp_recall)
+    print('POMDP f1_score= ', pomdp_f1)
+    
+    print('YOLO precision= ', yolo_precision)
+    print('YOLO recall= ', yolo_recall)
+    print('YOLO f1_score= ', yolo_f1)
+
+        # Create a dictionary
+    data = {
+        'Metric': ['True Positives', 'False Positives', 'True Negatives', 'False Negatives', 'Precision', 'Recall', 'F1 Score'],
+        'YOLO': [yolo_tp, yolo_fp, yolo_tn, yolo_fn, yolo_precision, yolo_recall, yolo_f1],
+        'POMDP': [pomdp_tp, pomdp_fp, pomdp_tn, pomdp_fn, pomdp_precision, pomdp_recall, pomdp_f1]
+    }
+
+    # Create DataFrame
+    df = pd.DataFrame(data)
+
+    # Print the output
+    print(df)
+
+    # Save the DataFrame as a csv
+    df.to_csv('perf_rgb_L3_pomdp.csv', index=False)
+    
